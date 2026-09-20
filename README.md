@@ -84,7 +84,7 @@ does not hand the terminal back until the server has answered a real request:
 | Step | What happens | How long |
 |---|---|---|
 | 1. host | Is the Docker daemon reachable by *your* user; `/dev/kfd` and `/dev/dri`; which GPUs are usable and what tensor-parallel size they imply; free space on **both** filesystems that matter (the checkpoints and the Docker data directory); is the port free | seconds |
-| 2. fetch | Image, AMD's MXFP4 checkpoint, the MTP-head rewrite that makes it loadable, the speculative drafter, the pinned libr4d kernels. This is `setup-mxfp4.sh` | one ~40 GiB download |
+| 2. fetch | Image, AMD's MXFP4 checkpoint, the MTP-head rewrite that makes it loadable, the speculative drafter, the pinned libr4d kernels, the W4A8 GEMM .so. This is `setup-mxfp4.sh` | one ~40 GiB download |
 | 3. start | The server, in the background | seconds |
 | 4. wait | Polls `/health`, and says what the log is doing meanwhile — building kernels, loading weights, compiling, capturing graphs | several minutes on a cold cache |
 | 5. test | Sends a chat completion and prints the answer | seconds |
@@ -194,7 +194,7 @@ Serving the plain FP8 checkpoint instead, through `docker compose`, is
 | 3. Download | [`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) (~19 GiB), fetched with the image's own `huggingface_hub` |
 | 4. Checkpoint rewrite | Rewrites it with an **fp8 MTP head** (`fp8_mtp.py`, ~15 min). AMD's release does not load as-is; see [Why AMD's checkpoint needs a rewrite](#why-amds-checkpoint-needs-a-rewrite). A checkpoint that already ships an fp8 MTP head skips this step |
 | 5. Drafter | Downloads [`tcclaviger/Qwen3.8-27B-DFlash2-FP8`](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8) (2 GiB), the block-diffusion drafter. `--no-drafter` skips it; then serve with `SPEC_METHOD=mtp` |
-| 6. Kernels | Builds the pinned **libr4d** inside the image (a few minutes, cached in `~/.cache/radiance-libr4d`). Load-bearing: the kernel shipped in the image predates the gated-delta-net overflow fix and NaNs this model's output. See [the GDN NaN](PERFORMANCE.md#the-gated-delta-net-nan-fixed-upstream) |
+| 6. Kernels | Builds the pinned **libr4d** and the W4A8 GEMM .so inside the image (a few minutes each, cached in `~/.cache/radiance-libr4d` and `~/.cache/radiance-mxfp4`). Load-bearing: the kernel shipped in the image predates the gated-delta-net overflow fix and NaNs this model's output. See [the GDN NaN](PERFORMANCE.md#the-gated-delta-net-nan-fixed-upstream) |
 
 ### First start is slow
 
@@ -554,6 +554,9 @@ content. The patch targets the engine, so it applies under either parser name.
 | `AUTO_R4D` | `1` | Build the pinned libr4d on first run. `0` uses the image's, which **NaNs this model** |
 | `R4D_SO` | unset | Use your own libr4d checkout directory instead; nothing is rebuilt behind your back |
 | `R4D_PIN` | `b9e42ab` | Which libr4d commit to build. Each is cached separately and keyed by the string, so `R4D_PIN=main` is fetched once and reused (`rm -rf ~/.cache/radiance-libr4d/main` to refresh) |
+| `AUTO_MXFP4_SO` | `1` | Build the W4A8 GEMM .so on first run (a few minutes, cached). `0` compiles it in-container on every start (~2 min each) |
+| `MXFP4_SO` | unset | Use your own `radiance_mxfp4_fp8.so` directory instead; nothing is rebuilt behind your back |
+| `MXFP4_SO_CACHE` | `~/.cache/radiance-mxfp4` | Where the built .so is cached. Keyed by the image + the `.hip`'s content (sha256, first 12 hex), so an edited `.hip` rebuilds and an unchanged one is reused (`rm -rf ~/.cache/radiance-mxfp4/<key>` to refresh) |
 | `MIN_M` | `0` | M above which the hand-written W4A8 kernel takes over from aiter. `0` means always: the comparison is `>`, so `1` would still send M=1 to aiter |
 | `RADIANCE_MXFP4_DECODE_MAX_M` | `64` (`128` if `MAXSEQS>8`) | The small-M decode GEMM band. Must cover `MAXSEQS x (SPEC+1)` rows or the biggest verify batches fall onto the prefill tile |
 | `FAST_DRAFT` | `1` | The int2 draft head with an exact rerank: +6.5% decode under mtp, +5.1% under dflash |

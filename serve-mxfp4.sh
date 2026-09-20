@@ -102,6 +102,9 @@ Everything is an environment variable; these are the ones worth knowing.
   MIN_M=0                   M above which the W4A8 kernel takes over from aiter (0 = always)
   AUTO_R4D=1                build the pinned libr4d on first run (cached); 0 uses the image's
   R4D_SO=<dir>              use your own libr4d checkout instead of building one
+  AUTO_MXFP4_SO=1           build the W4A8 GEMM .so on first run (cached); 0 compiles in-container
+  MXFP4_SO=<dir>            use your own radiance_mxfp4_fp8.so instead of building one
+  MXFP4_SO_CACHE=<dir>      where the built .so is cached (default ~/.cache/radiance-mxfp4)
   EXTRA="--enforce-eager"   extra `vllm serve` flags (same as passing them as arguments)
   HIP_FORCE_DEV_KERNARG=1   ROCm runtime knobs passed through when set: kernargs in VRAM,
   HSA_ENABLE_INTERRUPT=0    busy-poll completion signals, ROC_ACTIVE_WAIT_TIMEOUT=<us>
@@ -109,7 +112,7 @@ Everything is an environment variable; these are the ones worth knowing.
   VLLM_NO_USAGE_STATS=1     vLLM usage telemetry (default off here); 0 re-enables it
   DRY_RUN=1                 print the container command instead of running it
   DETACH=1                  start in the background and return (logs: RUNTIME logs -f NAME)
-  PREPARE_ONLY=1            do the one-time work (image, libr4d) and stop before serving
+  PREPARE_ONLY=1            do the one-time work (image, libr4d, W4A8 GEMM .so) and stop before serving
 
 Full knob reference: README.md. Design notes and measurements: MXFP4-NOTES.md.
 USAGE
@@ -574,8 +577,44 @@ if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   R4D_SO="$R4D_CACHE/$R4D_KEY"
   echo "[radiance] libr4d $R4D_KEY -> $R4D_SO"
 fi
+# ---------------------------------------------------------------- W4A8 GEMM .so cache
+# radiance_mxfp4_fp8.hip (the W4A8 GEMM) used to be hipcc-compiled on EVERY container start
+# (~2 min) because the .so lands in the ephemeral container filesystem. Build it once in a
+# throwaway container -- the same hipcc the venv loads it against, per the Makefile rule --
+# and cache it, so a restart copies the .so over instead of compiling.
+#
+# The key is the .hip's CONTENT, not a manual bump: the libr4d key can be static because its
+# input is a pinned commit, but the .hip is a working-tree file, and a stale .so is the exact
+# failure the entrypoint comment warns about (an Aug-20 build served a kernel 17 h older than
+# its source, fluent-looking garbage, no error anywhere). Edit the .hip -> new hash -> rebuild;
+# unchanged -> skip. The key also carries MXFP4_CUMODE (changes the compile flags) and the
+# image (pins the hipcc/pybind11 toolchain the build ran in).
+MXFP4_SO=${MXFP4_SO:-}
+MXFP4_HIP="$SCRIPT_DIR/radiance_mxfp4_fp8.hip"
+MXFP4_SO_CACHE=${MXFP4_SO_CACHE:-$HOME/.cache/radiance-mxfp4}
+MXFP4_KEY="${IMAGE##*/}"
+MXFP4_KEY="${MXFP4_KEY//:/-}-$(sha256sum "$MXFP4_HIP" | cut -c1-12)"
+if [ "${MXFP4_CUMODE:-0}" = 1 ]; then MXFP4_KEY="$MXFP4_KEY-cumode"; fi
+# A user-named MXFP4_SO wins and is never rebuilt behind your back; AUTO_MXFP4_SO=0 falls back
+# to the in-container compile (the old behaviour).
+if [ -z "$MXFP4_SO" ] && [ "${AUTO_MXFP4_SO:-1}" = 1 ]; then
+  if [ ! -f "$MXFP4_SO_CACHE/$MXFP4_KEY/radiance_mxfp4_fp8.so" ]; then
+    echo "[radiance] building radiance_mxfp4_fp8.so $MXFP4_KEY in $IMAGE -- one time, a few minutes"
+    rm -rf "$MXFP4_SO_CACHE/.build"
+    mkdir -p "$MXFP4_SO_CACHE/.build"
+    cp "$MXFP4_HIP" "$MXFP4_SO_CACHE/.build/"
+    "$RUNTIME" run --rm --entrypoint bash \
+      -v "$MXFP4_SO_CACHE/.build":/work:z -w /work \
+      -e MXFP4_CUMODE="${MXFP4_CUMODE:-0}" \
+      "$IMAGE" -c 'hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $([ "${MXFP4_CUMODE:-0}" = 1 ] && echo -mcumode) $(python3 -m pybind11 --includes) radiance_mxfp4_fp8.hip -o radiance_mxfp4_fp8.so'
+    # publish only after a successful build, so an interrupted one is not cached as good
+    mv "$MXFP4_SO_CACHE/.build" "$MXFP4_SO_CACHE/$MXFP4_KEY"
+  fi
+  MXFP4_SO="$MXFP4_SO_CACHE/$MXFP4_KEY"
+  echo "[radiance] mxfp4 gemm $MXFP4_KEY -> $MXFP4_SO"
+fi
 if [ "${PREPARE_ONLY:-0}" = 1 ]; then
-  echo "[radiance] prepared: image pulled and libr4d built -- ready to serve"
+  echo "[radiance] prepared: image pulled, libr4d and the W4A8 GEMM .so built -- ready to serve"
   exit 0
 fi
 # Where the hand-written W4A8 kernel takes over from aiter's W4A4 Triton path.
@@ -998,6 +1037,8 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   ${CT_MOUNT[@]+"${CT_MOUNT[@]}"} \
   ${R4D_SO:+-v "$R4D_SO":/r4d:z} \
   ${R4D_SO:+-e R4D_SO="$R4D_SO"} \
+  ${MXFP4_SO:+-v "$MXFP4_SO":/mxfp4:z} \
+  ${MXFP4_SO:+-e MXFP4_SO="$MXFP4_SO"} \
   --entrypoint bash \
   "$IMAGE" -lc '
     set -e
@@ -1037,8 +1078,16 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
        radiance_arnq.py radiance_tp3pad.py "$SP"/
     # MXFP4_CUMODE=1 builds the GEMM TU in CU mode (waves of a workgroup confined to one CU of the
     # WGP, LDS partitioned per CU) -- bit-identical output, an occupancy/LDS-placement A/B knob.
-    hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $([ "${MXFP4_CUMODE:-0}" = 1 ] && echo -mcumode) \
-      $(python3 -m pybind11 --includes) radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
+    # The .so is normally pre-built on the host and cached (MXFP4_SO, keyed on the .hip content),
+    # so a restart copies it over instead of paying the ~2 min hipcc compile; the in-container
+    # compile is the fallback when no cache is mounted (AUTO_MXFP4_SO=0 or a key miss).
+    if [ -n "${MXFP4_SO:-}" ] && [ -f /mxfp4/radiance_mxfp4_fp8.so ]; then
+      cp /mxfp4/radiance_mxfp4_fp8.so "$SP"/radiance_mxfp4_fp8.so
+      echo "[radiance] using cached radiance_mxfp4_fp8.so from $MXFP4_SO"
+    else
+      hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $([ "${MXFP4_CUMODE:-0}" = 1 ] && echo -mcumode) \
+        $(python3 -m pybind11 --includes) radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
+    fi
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --
     # it is bind-mounted at /r4d and its r4d.so replaces the one in the image. For an image
     # rebuild, the Dockerfile supports the same substitution through R4D_REPO / R4D_VERSION.

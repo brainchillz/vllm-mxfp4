@@ -185,10 +185,11 @@ else
 fi
 
 # ------------------------------------------------------------------ 6. kernels
-step "6/6  libr4d kernels"
-echo "  building the pinned libr4d inside the image (once, a few minutes; cached afterwards)."
+step "6/6  kernels (libr4d + W4A8 GEMM)"
+echo "  building the pinned libr4d and the W4A8 GEMM .so inside the image (once, a few"
+echo "  minutes each; cached afterwards)."
 echo "  The kernel shipped in the image predates the gated-delta-net overflow fix and NaNs this"
-echo "  model's output, so this build is load-bearing, not an optimization."
+echo "  model's output, so the libr4d build is load-bearing, not an optimization."
 MODELS="$MODELS" IMAGE="$IMAGE" RUNTIME="$RUNTIME" PREPARE_ONLY=1 "$SCRIPT_DIR/serve-mxfp4.sh"
 
 cat <<EOF
