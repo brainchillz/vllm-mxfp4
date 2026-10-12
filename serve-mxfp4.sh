@@ -544,6 +544,7 @@ R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 # nothing at TP>=2 has been gated on it; R4D_KEY=b9e42ab-rx9 opts a TP=2 serve in for that gate.
 R4D_PATCH_RX9="$SCRIPT_DIR/r4d_radiance_extras_rx9.patch"
 R4D_PATCH_RX10="$SCRIPT_DIR/r4d_radiance_extras_rx10.patch"
+R4D_PATCH_RX11="$SCRIPT_DIR/r4d_radiance_extras_rx11.patch"   # rx11 = rx6 + ar_oneshot_4rank_exact (TP=4 all-reduce)
 # R4D_KEY=<key> in the environment selects a specific libr4d build (e.g. b9e42ab-rx7, what the
 # ParoQuant units serve on) instead of the launcher's default below.
 if [ -z "${R4D_KEY:-}" ]; then
@@ -554,8 +555,10 @@ if [ -z "${R4D_KEY:-}" ]; then
   fi
   # rx10 = rx9 + the lazy-snapshot GDN kernels (gdn_lazy_update / gdn_lazy_materialize).
   if [ "$GDN_LAZY" = 1 ] && [ -f "$R4D_PATCH_RX10" ]; then R4D_KEY="$R4D_PIN-rx10"; fi
+  # rx11 = rx6 + the 4-rank one-shot all-reduce; without it TP=4 reductions ride RCCL (~38 us vs ~13 us per call).
+  if [ "$TP" = 4 ] && [ -f "$R4D_PATCH_RX11" ]; then R4D_KEY="$R4D_PIN-rx11"; fi
 fi
-case "$R4D_KEY" in *-rx9) R4D_PATCH="$R4D_PATCH_RX9" ;; *-rx10) R4D_PATCH="$R4D_PATCH_RX10" ;; esac
+case "$R4D_KEY" in *-rx9) R4D_PATCH="$R4D_PATCH_RX9" ;; *-rx10) R4D_PATCH="$R4D_PATCH_RX10" ;; *-rx11) R4D_PATCH="$R4D_PATCH_RX11" ;; esac
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -914,7 +917,9 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e VLLM_ROCM_USE_AITER_LINEAR=0 -e VLLM_ROCM_USE_AITER_FP8BMM=0 \
   -e VLLM_ROCM_USE_AITER_FP4BMM=0 -e VLLM_ROCM_USE_AITER_RMSNORM=0 \
   -e NCCL_PROTO=Simple \
+  -e GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-1}" \
   -e RADIANCE_USE_R4D="${RADIANCE_USE_R4D:-1}" -e RADIANCE_USE_R4D_AR="${RADIANCE_USE_R4D_AR:-1}" -e RADIANCE_USE_R4D_AR_QUANT="${RADIANCE_USE_R4D_AR_QUANT:-1}" \
+  -e RADIANCE_AR4_MAX_KB="${RADIANCE_AR4_MAX_KB:-768}" -e RADIANCE_AR4_NB="${RADIANCE_AR4_NB:-8}" -e RADIANCE_AR4_SHADOW="${RADIANCE_AR4_SHADOW:-0}" \
   -e RADIANCE_R4D_REPORT=1 -e RADIANCE_AR_MAX_KB="$AR_MAX_KB" \
   -e RADIANCE_AR_QBITS="${RADIANCE_AR_QBITS:-6}" \
   -e RADIANCE_PRESHUFFLE="${RADIANCE_PRESHUFFLE:-1}" -e RADIANCE_FUSE_RMS_QUANT="${RADIANCE_FUSE_RMS_QUANT:-1}" \
@@ -1022,7 +1027,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     python3 patch_step_trace.py
     python3 patch_ar_geometry.py
     python3 patch_ar_qbits.py          # RADIANCE_AR_QBITS: 6 (shipped) | 5 | 4-bit all-reduce wire payload (libr4d rx8+)
-    python3 patch_ar_3rank.py
+    python3 patch_ar_4rank.py          # ws 2/3/4 one-shot all-reduce wiring; supersedes patch_ar_3rank.py (never run both)
     python3 patch_gdn_glue.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     if [ "${RADIANCE_GDN_LAZY:-0}" = 1 ]; then python3 patch_gdn_lazy.py; fi   # TP=1 profile only; after the gdn builder patches it anchors on

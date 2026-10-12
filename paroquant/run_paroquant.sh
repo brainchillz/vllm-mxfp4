@@ -167,6 +167,7 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
   echo "  serving without it falls back to the image's libr4d, which NaNs this model." >&2
   echo "  Build the current one:  ./setup-paroquant.sh   (produces b9e42ab-rx6)" >&2
   echo "  then either R4D_KEY=b9e42ab-rx6 $0 ... or re-gate and change the default here." >&2
+  echo "  TP=4 wants the 4-rank all-reduce: TP=4 PREPARE_ONLY=1 ./serve-mxfp4.sh builds b9e42ab-rx11, then R4D_KEY=b9e42ab-rx11 $0 ..." >&2
   exit 1
 }
 # Rotation stream: fused add+rmsnorm+rotate+quant producers for the norm-fed linears (decode
@@ -287,7 +288,9 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e VLLM_ROCM_USE_AITER_LINEAR=0 -e VLLM_ROCM_USE_AITER_FP8BMM=0 \
   -e VLLM_ROCM_USE_AITER_FP4BMM=0 -e VLLM_ROCM_USE_AITER_RMSNORM=0 \
   -e NCCL_PROTO=Simple \
-  -e RADIANCE_USE_R4D=1 -e RADIANCE_USE_R4D_AR=1 -e RADIANCE_USE_R4D_AR_QUANT=1 \
+  -e GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-1}" \
+  -e RADIANCE_USE_R4D=1 -e RADIANCE_USE_R4D_AR="${RADIANCE_USE_R4D_AR:-1}" -e RADIANCE_USE_R4D_AR_QUANT=1 \
+  -e RADIANCE_AR4_MAX_KB="${RADIANCE_AR4_MAX_KB:-768}" -e RADIANCE_AR4_NB="${RADIANCE_AR4_NB:-8}" -e RADIANCE_AR4_SHADOW="${RADIANCE_AR4_SHADOW:-0}" \
   -e RADIANCE_R4D_REPORT=1 -e RADIANCE_AR_MAX_KB=86016 \
   -e RADIANCE_STEP_TRACE="${RADIANCE_STEP_TRACE:-0}" \
   -e RADIANCE_DFLASH_CAPTURE_DIR="${CAPTURE_DIR:+/capture}" "${CAPTURE_MOUNT[@]}" \
@@ -358,6 +361,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
     python3 patch_dflash_selector_topk.py
     python3 patch_dynwidth.py
     python3 patch_ar_geometry.py
+    python3 patch_ar_4rank.py          # ws 2/3/4 one-shot all-reduce wiring (TP=4 needs libr4d rx11: R4D_KEY=b9e42ab-rx11)
     python3 patch_gdn_merge_inproj.py
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply"

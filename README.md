@@ -321,6 +321,25 @@ libr4d extras rx6) has been measured on three cards; it stays out of the auto-pi
 passes that hardware gate. Every `TP != 3` serve passes `RADIANCE_TP_PAD=0` and is byte-identical
 to before.
 
+### TP=4
+
+Four R9700s on PCIe with peer access for every pair (the preamble prints the `P2P access` matrix). `TP=4` selects
+libr4d **rx11**, which adds the 4-rank one-shot P2P all-reduce; without it every tensor-parallel reduction at TP=4
+goes through RCCL (~38 us per call at decode sizes against ~13 us), and `patch_ar_4rank.py` wires the kernel in for
+world sizes 2, 3 and 4. Decode-size messages only: anything above `RADIANCE_AR4_MAX_KB` (768) stays on RCCL,
+because the push moves the message to three peers.
+
+```sh
+TP=4 PREPARE_ONLY=1 ./serve-mxfp4.sh        # builds b9e42ab-rx11 once
+TP=4 GPUS=0,1,2,3 ./serve-mxfp4.sh          # or the ParoQuant launcher with TP=4 R4D_KEY=b9e42ab-rx11
+```
+
+Both launchers now set **`GPU_MAX_HW_QUEUES=1`** in the container. On gfx1201 a process otherwise lands at random in a
+slow dispatch state (ROCm/legacy-rocm-build#6347, #6685: ~15 us of idle after every small kernel in graph replay)
+that costs more than any kernel saves. Six of eight TP=4 boots on one box landed in it. With the flag every boot
+was fast and concurrency 1-8 showed no cost. `RADIANCE_USE_R4D_AR=0` returns the all-reduce to RCCL unchanged, which is the A/B
+switch and the escape hatch. Numbers: PERFORMANCE.md, top row.
+
 ### KV cache calibration
 
 An explicit `--kv-cache-memory` beats letting vLLM profile, because profiling is deliberately
@@ -565,6 +584,8 @@ content. The patch targets the engine, so it applies under either parser name.
 | `RADIANCE_MXFP4_SANITIZE` | `0` | Zero non-finite activations. Only useful with `AUTO_R4D=0`, where it gets perplexity to 8.4004 instead of 653586 |
 
 ### Diagnostics
+
+`RADIANCE_AR4_SHADOW=1` (with `--enforce-eager`, TP=4): recompute every 4-rank one-shot all-reduce with RCCL and compare across ranks; logs `AR4 SHADOW n=... bad=0 rankdiff=0` on rank 0. A correctness gate for a new box, not a serving mode.
 
 `RADIANCE_MXFP4_CHECKALL`, `_SHADOW`, `_KERNEL_NK`, `_PERBLOCK_NK`, `_MHIST`,
 `RADIANCE_GDN_NANTRACE` and `PROFILE_DIR` are unset by default and documented where they are read in
